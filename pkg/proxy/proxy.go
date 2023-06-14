@@ -2,12 +2,15 @@
 package proxy
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/proxy"
@@ -177,7 +180,7 @@ func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, e
 	proxyHandler.FlushInterval = p.config.FlushInterval
 
 	// Set up WebSocket proxy handler
-	wsProxyHandler := proxy.NewUpgradeAwareHandler(url, p.clientTransport, true, false, p.handleError)
+	wsProxyHandler := proxy.NewUpgradeAwareHandler(url, p.clientTransport, true, false, errorResponderWrapper{p.handleError})
 
 	waitCh, listenerStoppedCh, err := p.serve(proxyHandler, wsProxyHandler, stopCh)
 	if err != nil {
@@ -211,6 +214,29 @@ func (p *Proxy) serve(handler http.Handler, wsHandler http.Handler, stopCh <-cha
 func (p *Proxy) withWebSocketHandler(handler http.Handler, wsHandler http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		if websocket.IsWebSocketUpgrade(req) {
+			// Extract additional protocol
+			protocols := websocket.Subprotocols(req)
+			var authData string
+			for _, protocol := range protocols {
+				if strings.HasPrefix(protocol, "base64url.bearer.authorization.k8s.io.") {
+					authData = strings.TrimPrefix(protocol, "base64url.bearer.authorization.k8s.io.")
+					break
+				}
+			}
+
+			// Decode base64 auth data
+			decodedAuthData, err := base64.StdEncoding.DecodeString(authData)
+			if err != nil {
+				log.Printf("Error decoding base64 auth data: %v", err)
+				return
+			}
+			// Set authorization header
+			req.Header.Set("Authorization", string(decodedAuthData))
+
+			// Get the impersonation headers from the context.
+			impersonationConf := context.ImpersonationConfig(req)
+			log.Printf("ImpersonationConfig: %v", impersonationConf.ImpersonationConfig)
+			fmt.Printf("[%s] Handling WS Request, Header: %s\n", time.Now().Format(timestampLayout), req.Header)
 			wsHandler.ServeHTTP(rw, req)
 		} else {
 			handler.ServeHTTP(rw, req)
@@ -239,7 +265,7 @@ func (p *Proxy) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	// Set up impersonation request.
 	rt := transport.NewImpersonatingRoundTripper(*impersonationConf.ImpersonationConfig, p.clientTransport)
-
+	//log.Printf("ImpersonationConfig: %v", *impersonationConf.ImpersonationConfig)
 	// Log the request
 	logging.LogSuccessfulRequest(req, *impersonationConf.InboundUser, *impersonationConf.ImpersonatedUser)
 
