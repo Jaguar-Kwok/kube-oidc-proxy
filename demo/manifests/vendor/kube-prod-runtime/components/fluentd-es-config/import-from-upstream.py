@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Bitnami Kubernetes Production Runtime - A collection of services that makes it
 # easy to run production workloads in Kubernetes.
