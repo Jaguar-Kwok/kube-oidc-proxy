@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/proxy"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	"k8s.io/apiserver/pkg/server"
@@ -18,6 +19,7 @@ import (
 	"k8s.io/client-go/transport"
 	"k8s.io/klog"
 
+	"github.com/gorilla/websocket"
 	"github.com/jetstack/kube-oidc-proxy/cmd/app/options"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/audit"
 	"github.com/jetstack/kube-oidc-proxy/pkg/proxy/context"
@@ -73,6 +75,13 @@ type Proxy struct {
 // the ca file from the options
 type CAFromFile struct {
 	CAFile string
+}
+type errorResponderWrapper struct {
+	errorHandlerFn
+}
+
+func (e errorResponderWrapper) Error(w http.ResponseWriter, r *http.Request, err error) {
+	e.errorHandlerFn(w, r, err)
 }
 
 func (caFromFile CAFromFile) CurrentCABundleContent() []byte {
@@ -167,7 +176,10 @@ func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, e
 	proxyHandler.ErrorHandler = p.handleError
 	proxyHandler.FlushInterval = p.config.FlushInterval
 
-	waitCh, listenerStoppedCh, err := p.serve(proxyHandler, stopCh)
+	// Set up WebSocket proxy handler
+	wsProxyHandler := proxy.NewUpgradeAwareHandler(url, p.clientTransport, true, false, p.handleError)
+
+	waitCh, listenerStoppedCh, err := p.serve(proxyHandler, wsProxyHandler, stopCh)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -175,9 +187,12 @@ func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, e
 	return waitCh, listenerStoppedCh, nil
 }
 
-func (p *Proxy) serve(handler http.Handler, stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, error) {
+func (p *Proxy) serve(handler http.Handler, wsHandler http.Handler, stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, error) {
 	// Setup proxy handlers
 	handler = p.withHandlers(handler)
+
+	// Add WebSocket handler
+	handler = p.withWebSocketHandler(handler, wsHandler)
 
 	// Run auditor
 	if err := p.auditor.Run(stopCh); err != nil {
@@ -191,6 +206,16 @@ func (p *Proxy) serve(handler http.Handler, stopCh <-chan struct{}) (<-chan stru
 	}
 
 	return waitCh, listenerStoppedCh, nil
+}
+
+func (p *Proxy) withWebSocketHandler(handler http.Handler, wsHandler http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if websocket.IsWebSocketUpgrade(req) {
+			wsHandler.ServeHTTP(rw, req)
+		} else {
+			handler.ServeHTTP(rw, req)
+		}
+	})
 }
 
 // RoundTrip is called last and is used to manipulate the forwarded request using context.
